@@ -1,17 +1,53 @@
-# b23-llm-proxy
+# Usage Instructions
 
-## Overview
+## Local Run
 
-This project serves as a proxy for LLM services.
+To run the application locally, ensure you have the required dependencies installed. Use the following command:
 
-## Usage
+```bash
+pip install -r requirements.txt
+```
 
-### API Endpoints
+Then, you can run the application with:
 
-- `/admin/keys/upsert`
+```bash
+python main.py
+```
 
-This endpoint manages admin keys for the application.
+## Environment Variables
 
-## Notes
+Ensure the following environment variables are set before running the application:
+- `API_KEY`: Your API key for external services.
+- `DATABASE_URL`: The URL to your database.
 
-Ensure that all interactions with the API adhere to the expected format and functionality.
+## OpenAI Chat Completions
+
+Example usage for OpenAI Chat Completions:
+
+```python
+import openai
+
+response = openai.ChatCompletion.create(
+  model='gpt-4',
+  messages=[{'role': 'user', 'content': 'Hello!'}]
+)
+```
+
+## Anthropic Messages/Claude Code
+
+Example usage for Anthropic Messages:
+
+```python
+import anthropic
+
+response = anthropic.Completion.create(
+  model='claude-v1',
+  prompt='Hello!'
+)
+```
+
+## events.jsonl Description
+
+events.jsonl contains logs of events for tracking interactions, including request and response data for API calls. Each line represents a unique event with its timestamp, type, and data.
+
+For more detailed information, please refer to the documentation provided with your SDK or API.
