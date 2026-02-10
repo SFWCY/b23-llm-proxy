@@ -38,6 +38,7 @@ env/
 .env.local
 
 # Data files (keep structure, not content)
+data/keys.json
 data/events.jsonl
 data/*.jsonl
 

@@ -15,9 +15,15 @@ import httpx
 
 
 class SmokeTest:
-    def __init__(self, base_url: str = "http://localhost:8866"):
+    def __init__(self, base_url: str = "http://localhost:8866", admin_token: str = None):
         self.base_url = base_url
-        self.admin_token = os.getenv("ADMIN_TOKEN", "test-admin-token")
+        # Use provided token or from environment, no default for security
+        self.admin_token = admin_token or os.getenv("ADMIN_TOKEN")
+        if not self.admin_token:
+            raise ValueError(
+                "ADMIN_TOKEN must be set via environment variable or --admin-token argument. "
+                "Never use a default token in production."
+            )
         self.test_api_key = "test-key-" + str(int(time.time()))
         self.results: Dict[str, bool] = {}
     
@@ -121,14 +127,18 @@ async def main():
         default="http://localhost:8866",
         help="Base URL of the proxy server (default: http://localhost:8866)"
     )
+    parser.add_argument(
+        "--admin-token",
+        help="Admin token for testing (default: from ADMIN_TOKEN env var)"
+    )
     args = parser.parse_args()
     
-    # Check if ADMIN_TOKEN is set
-    if not os.getenv("ADMIN_TOKEN"):
-        print("⚠️  Warning: ADMIN_TOKEN environment variable not set")
-        print("   Using default test token. Set ADMIN_TOKEN for real tests.\n")
+    try:
+        tester = SmokeTest(base_url=args.url, admin_token=args.admin_token)
+    except ValueError as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
     
-    tester = SmokeTest(base_url=args.url)
     success = await tester.run_all_tests()
     
     sys.exit(0 if success else 1)
