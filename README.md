@@ -1,37 +1,17 @@
-# LLM Proxy Gateway
+# b23-llm-proxy
 
-This project implements an LLM proxy gateway using FastAPI, allowing you to interact with both OpenAI's and Anthropic's messaging APIs.
+## Overview
 
-## Setup
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/SFWCY/b23-llm-proxy.git
-   ```
-
-2. Navigate to the project directory:
-   ```bash
-   cd b23-llm-proxy
-   ```
-
-3. Install the requirements:
-   ```bash
-   pip install -r requirements.txt
-   ```
+This project serves as a proxy for LLM services.
 
 ## Usage
 
-To run the FastAPI server:
-```bash
-uvicorn gateway.main:app --host 0.0.0.0 --port 8000
-```
+### API Endpoints
 
-You can then access the API at `http://localhost:8000`.  
+- `/admin/keys/upsert`
 
-## Admin Endpoint
+This endpoint manages admin keys for the application.
 
-There is an admin endpoint to upsert keys which can be found at `/admin/keys`. This endpoint requires proper authentication to ensure secure handling of keys.
+## Notes
 
-## Events Logging
-
-Events are written asynchronously to `data/events.jsonl` to maintain records of the interactions made through the gateway.
+Ensure that all interactions with the API adhere to the expected format and functionality.
