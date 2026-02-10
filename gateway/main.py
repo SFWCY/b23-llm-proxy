@@ -15,6 +15,14 @@ DATA_DIR = os.getenv("DATA_DIR", "./data")
 KEYS_FILE = os.getenv("KEYS_FILE", os.path.join(DATA_DIR, "keys.json"))
 EVENTS_FILE = os.getenv("EVENTS_FILE", os.path.join(DATA_DIR, "events.jsonl"))
 
+# Admin token for /admin/* endpoints
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+# Event logging configuration
+MAX_LOG_CHUNKS = int(os.getenv("MAX_LOG_CHUNKS", "50"))
+MAX_LOG_FIELD_SIZE = int(os.getenv("MAX_LOG_FIELD_SIZE", "2000"))
+FULL_TRACE_LOGGING = os.getenv("FULL_TRACE_LOGGING", "false").lower() == "true"
+
 # 允许略超：只做轻量预检（可选）；MVP 先不拦截，后续接入滚动30天统计再开启
 ENABLE_QUOTA_PRECHECK = os.getenv("ENABLE_QUOTA_PRECHECK", "false").lower() == "true"
 
@@ -133,6 +141,32 @@ async def event_writer_loop():
 def now_ms() -> int:
     return int(time.time() * 1000)
 
+def limit_log_field(value: Any) -> Any:
+    """Limit the size of logged fields to prevent unbounded growth."""
+    if FULL_TRACE_LOGGING:
+        return value
+    
+    if value is None:
+        return value
+    
+    # For strings, limit size
+    if isinstance(value, str):
+        if len(value) > MAX_LOG_FIELD_SIZE:
+            return value[:MAX_LOG_FIELD_SIZE] + f"... (truncated, {len(value)} total chars)"
+        return value
+    
+    # For dicts/lists, convert to JSON and limit
+    if isinstance(value, (dict, list)):
+        try:
+            json_str = json.dumps(value, ensure_ascii=False)
+            if len(json_str) > MAX_LOG_FIELD_SIZE:
+                return json_str[:MAX_LOG_FIELD_SIZE] + f"... (truncated, {len(json_str)} total chars)"
+            return value
+        except Exception:
+            return str(value)[:MAX_LOG_FIELD_SIZE]
+    
+    return value
+
 def extract_bearer_or_key(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
     if x_api_key:
         return x_api_key.strip()
@@ -179,7 +213,17 @@ async def healthz():
 # --- key management (simple, for ops; future: move to management platform) ---
 
 @app.post("/admin/keys/upsert")
-async def admin_keys_upsert(payload: Dict[str, Any]):
+async def admin_keys_upsert(
+    payload: Dict[str, Any],
+    x_admin_token: Optional[str] = Header(default=None)
+):
+    # Require admin token for security
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN not configured on server")
+    
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing x-admin-token header")
+    
     api_key = payload.get("api_key")
     user_id = payload.get("user_id")
     active = bool(payload.get("active", True))
@@ -243,9 +287,9 @@ async def openai_chat_completions(
                     ended_at_ms=ended,
                     latency_ms=ended - started,
                     status_code=r.status_code,
-                    error=None if r.status_code < 400 else json.dumps(content, ensure_ascii=False),
-                    prompt=body,
-                    response=content,
+                    error=None if r.status_code < 400 else limit_log_field(json.dumps(content, ensure_ascii=False)),
+                    prompt=limit_log_field(body),
+                    response=limit_log_field(content),
                     usage=usage,
                 ))
 
@@ -263,8 +307,8 @@ async def openai_chat_completions(
                     ended_at_ms=ended,
                     latency_ms=ended - started,
                     status_code=502,
-                    error=str(e),
-                    prompt=body,
+                    error=limit_log_field(str(e)),
+                    prompt=limit_log_field(body),
                     response=None,
                     usage=None,
                 ))
@@ -279,6 +323,7 @@ async def openai_chat_completions(
             upstream_id: Optional[str] = None
             usage: Optional[Dict[str, Any]] = None
             chunks: List[str] = []  # store raw SSE lines (optional; can be big)
+            buffer = ""  # buffer for incomplete lines
 
             try:
                 async with client.stream("POST", upstream_url, headers=headers, json=body) as resp:
@@ -289,25 +334,42 @@ async def openai_chat_completions(
                         # capture (optional)
                         try:
                             s = b.decode("utf-8", errors="ignore")
-                            chunks.append(s)
-                            # heuristic: some providers may emit a final JSON object with "usage" in stream
-                            if '"usage"' in s and "prompt_tokens" in s and "completion_tokens" in s:
-                                # try extract JSON from "data: {...}"
-                                for line in s.splitlines():
-                                    if line.startswith("data: "):
-                                        data = line[6:].strip()
-                                        if data and data != "[DONE]":
-                                            try:
-                                                obj = json.loads(data)
-                                                u = openai_usage_from_json(obj)
-                                                if u:
-                                                    usage = u
-                                                if obj.get("model"):
-                                                    model = obj["model"]
-                                                if obj.get("id"):
-                                                    upstream_id = obj["id"]
-                                            except Exception:
-                                                pass
+                            buffer += s
+                            
+                            # Process complete lines
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                line = line.strip()
+                                
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                
+                                data = line[6:].strip()
+                                if not data or data == "[DONE]":
+                                    continue
+                                
+                                # Store limited chunks
+                                if len(chunks) < MAX_LOG_CHUNKS:
+                                    chunks.append(line)
+                                
+                                # Try to extract usage, model, and id from chunk
+                                try:
+                                    obj = json.loads(data)
+                                    
+                                    # Capture usage if present
+                                    u = openai_usage_from_json(obj)
+                                    if u:
+                                        usage = u
+                                    
+                                    # Capture model if present
+                                    if obj.get("model"):
+                                        model = obj["model"]
+                                    
+                                    # Capture id if present
+                                    if obj.get("id"):
+                                        upstream_id = obj["id"]
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
@@ -324,8 +386,8 @@ async def openai_chat_completions(
                     latency_ms=ended - started,
                     status_code=status_code,
                     error=None if status_code < 400 else "upstream streaming error",
-                    prompt=body,
-                    response={"sse_chunks": chunks[-200:]} if chunks else None,  # avoid unbounded growth
+                    prompt=limit_log_field(body),
+                    response=limit_log_field({"sse_chunks": chunks}) if chunks else None,
                     usage=usage,
                 ))
             except httpx.HTTPError as e:
@@ -341,8 +403,8 @@ async def openai_chat_completions(
                     ended_at_ms=ended,
                     latency_ms=ended - started,
                     status_code=502,
-                    error=str(e),
-                    prompt=body,
+                    error=limit_log_field(str(e)),
+                    prompt=limit_log_field(body),
                     response=None,
                     usage=None,
                 ))
@@ -423,9 +485,9 @@ async def anthropic_messages(
                 ended_at_ms=ended,
                 latency_ms=ended - started,
                 status_code=r.status_code,
-                error=None if r.status_code < 400 else json.dumps(content, ensure_ascii=False),
-                prompt=body,
-                response=anthropic_resp,
+                error=None if r.status_code < 400 else limit_log_field(json.dumps(content, ensure_ascii=False)),
+                prompt=limit_log_field(body),
+                response=limit_log_field(anthropic_resp),
                 usage=usage if usage else None,
             ))
 
@@ -439,63 +501,65 @@ async def anthropic_messages(
             usage: Optional[Dict[str, Any]] = None
             upstream_id: Optional[str] = None
             upstream_model: Optional[str] = openai_body.get("model")
+            buffer = ""  # buffer for incomplete lines
+            content_block_started = False
 
             message_id = f"msg_{uuid.uuid4().hex[:24]}"
-            # message_start
-            yield _sse("message_start", {
-                "type": "message_start",
-                "message": {
-                    "id": message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                    },
-                }
-            })
-            # content_block_start index=0 text
-            yield _sse("content_block_start", {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            })
-
+            
             try:
+                # message_start
+                yield _sse("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    }
+                })
+                
                 async with client.stream("POST", upstream_url, headers=headers, json={**openai_body, "stream": True}) as resp:
                     status_code = resp.status_code
                     async for b in resp.aiter_bytes():
                         # parse OpenAI SSE lines
-                        for line in b.decode("utf-8", errors="ignore").splitlines():
+                        buffer += b.decode("utf-8", errors="ignore")
+                        
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            
                             if not line.startswith("data: "):
                                 continue
+                            
                             data = line[6:].strip()
                             if not data:
                                 continue
+                            
                             if data == "[DONE]":
-                                # close content block
-                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                                # Ensure content block is stopped before message ends
+                                if content_block_started:
+                                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                                    content_block_started = False
+                                
                                 # message_delta with usage if available
-                                if usage:
-                                    yield _sse("message_delta", {
-                                        "type": "message_delta",
-                                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                                        "usage": {"output_tokens": int(usage.get("completion_tokens", 0) or 0)}
-                                    })
-                                else:
-                                    yield _sse("message_delta", {
-                                        "type": "message_delta",
-                                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                                        "usage": {"output_tokens": 0}
-                                    })
+                                anthropic_usage = anthropic_usage_from_openai_usage(usage) if usage else {"output_tokens": 0}
+                                yield _sse("message_delta", {
+                                    "type": "message_delta",
+                                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                    "usage": anthropic_usage
+                                })
+                                
                                 yield _sse("message_stop", {"type": "message_stop"})
-                                yield b"data: [DONE]\n\n"
+                                
                                 ended = now_ms()
                                 await safe_enqueue_event(MeterEvent(
                                     request_id=req_id,
@@ -509,8 +573,8 @@ async def anthropic_messages(
                                     latency_ms=ended - started,
                                     status_code=status_code,
                                     error=None if status_code < 400 else "upstream streaming error",
-                                    prompt=body,
-                                    response={"text": accumulated_text},
+                                    prompt=limit_log_field(body),
+                                    response=limit_log_field({"text": accumulated_text}),
                                     usage=usage,
                                 ))
                                 return
@@ -537,6 +601,15 @@ async def anthropic_messages(
                                 delta_text = None
 
                             if delta_text:
+                                # Start content block on first text delta
+                                if not content_block_started:
+                                    yield _sse("content_block_start", {
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": {"type": "text", "text": ""},
+                                    })
+                                    content_block_started = True
+                                
                                 accumulated_text += delta_text
                                 yield _sse("content_block_delta", {
                                     "type": "content_block_delta",
@@ -556,8 +629,8 @@ async def anthropic_messages(
                     ended_at_ms=ended,
                     latency_ms=ended - started,
                     status_code=502,
-                    error=str(e),
-                    prompt=body,
+                    error=limit_log_field(str(e)),
+                    prompt=limit_log_field(body),
                     response=None,
                     usage=usage,
                 ))
